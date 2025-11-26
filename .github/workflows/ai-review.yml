@@ -1,0 +1,160 @@
+name: AI Code Review Bot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  ai_review:
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ github.token }}                 # per gh pr comment / diff
+      GH_MODELS_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}  # PAT con models:read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract PR diff
+        id: diff
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} > pr_diff.txt
+          echo "PR diff extracted."
+
+      # ------------------------------
+      # Setup Node + dependencies
+      # ------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install AI dependencies
+        run: |
+          cat > package.json << 'EOF'
+          {
+            "type": "module",
+            "dependencies": {
+              "@azure-rest/ai-inference": "latest",
+              "@azure/core-auth": "latest",
+              "@azure/core-sse": "latest"
+            }
+          }
+          EOF
+
+          npm install
+
+      # ------------------------------
+      # AI Code Review (GPT-4o-mini)
+      # ------------------------------
+      - name: Run AI Code Review using GPT-4o-mini
+        id: ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
+        run: |
+          cat > ai_review.js << 'EOF'
+          import ModelClient, { isUnexpected } from "@azure-rest/ai-inference";
+          import { AzureKeyCredential } from "@azure/core-auth";
+          import fs from "fs";
+
+          const token = process.env.GITHUB_TOKEN;
+          const endpoint = "https://models.github.ai/inference";
+          const model = "openai/gpt-4o-mini";
+
+          const diff = fs.readFileSync("pr_diff.txt", "utf8");
+
+          const prompt = `
+          You are an expert senior code and content reviewer.
+          You receive a unified Git diff. Your tasks are:
+
+          1. *Change Overview (what changed vs previous version)*
+            - Provide a concise bullet list of the main changes.
+            - For each item, mention the file name and a short description.
+            - Example: file.txt – new text file added containing a personal message.
+
+          2. *Detailed Diff Explanation (before vs after)*
+            - For each file in the diff, explain what changed compared to the previous version:
+              - What was added?
+              - What was removed?
+              - What was modified?
+            - When useful, quote small snippets (in backticks) to show the old vs new behavior.
+
+          3. *Quality, Risks & Sensitive Content*
+            - Highlight bugs, logic issues, readability problems, and code smells.
+            - Analyze configuration and text files as well, not only source code.
+            - Explicitly flag any *personal, sensitive or inappropriate content* that should not be committed (e.g. names, private messages, secrets).
+            - Mention potential security or privacy risks.
+
+          4. *Actionable Recommendations*
+            - Provide practical suggestions to improve the changes.
+            - You can propose refactors, better naming, extra tests, or removal of sensitive data.
+
+          Respond in clear Markdown with the following sections:
+
+          - Summary of Changes
+          - File-by-file Diff Explanation
+          - Risks & Sensitive Content
+          - Recommendations
+
+          Diff:
+          ${diff}
+          `;
+
+          async function main() {
+            try {
+              const client = ModelClient(endpoint, new AzureKeyCredential(token));
+
+              const response = await client.path("/chat/completions").post({
+                body: {
+                  model,
+                  messages: [
+                    { role: "user", content: prompt }
+                  ]
+                }
+              });
+
+              if (isUnexpected(response)) {
+                const err = response.body.error?.message || JSON.stringify(response.body);
+                fs.writeFileSync("ai_review.md", "ERROR: " + err);
+                return;
+              }
+
+              const output = response.body.choices[0].message.content;
+              fs.writeFileSync("ai_review.md", output);
+
+            } catch (err) {
+              fs.writeFileSync("ai_review.md", "ERROR: " + err.message);
+            }
+          }
+
+          main();
+          EOF
+
+          node ai_review.js
+          echo "AI Review generated."
+
+      # ------------------------------
+      # Comment the Pull Request
+      # ------------------------------
+      - name: Comment on Pull Request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY=$(cat ai_review.md)
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "🤖 **AI Code Review (GPT-4o-mini)** $BODY" 
+
+      # ------------------------------
+      # Artifact
+      # ------------------------------
+      - name: Upload AI Review Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-report
+          path: ai_review.md

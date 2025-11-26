@@ -1,0 +1,9 @@
+*
+!.gitignore
+!.github/
+!.github/workflows/
+!.github/workflows/*
+!bot/
+!bot/review.py
+!reports/
+!README.md
